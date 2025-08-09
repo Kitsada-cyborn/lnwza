@@ -1,0 +1,460 @@
+ดีมาก — ผมจะให้ **แผนปฏิบัติ (step-by-step)** ที่ชัดเจน ตั้งแต่ทำความสะอาดข้อมูล ไปจนถึงได้โมเดล Hybrid (GNN + LightGBM) พร้อมโค้ดตัวอย่างที่คุณสามารถคัด-วาง (copy-paste) ไปรันได้เลย โดยใช้ไฟล์ที่คุณอัปโหลด `"/mnt/data/blacklistaccount.csv"` เป็นจุดเริ่ม
+
+ผมแบ่งเป็น 12 ขั้นตอนหลัก (แต่ละข้อมีคำอธิบาย ผลลัพธ์ที่คาดไว้ และโค้ดตัวอย่าง) — เริ่มเลย:
+
+# 1) ตรวจสอบและทำความสะอาดข้อมูล (Data cleaning)
+
+**ทำอะไร:** โหลด CSV, แปลงคอลัมน์หลักให้สะอาด (account id, name, email, shop, amount, date)
+**ผลลัพธ์:** ไฟล์ `cleaned_accounts.csv`
+
+```python
+import pandas as pd
+import re
+df = pd.read_csv("/mnt/data/blacklistaccount.csv")
+
+# เปลี่ยนชื่อคอลัมน์ที่เราจะใช้
+df = df.rename(columns={
+  "เลขบัญชี หรือเบอร์ TrueMoney Wallet":"account_raw",
+  "ชื่อธนาคาร":"bank_name",
+  "ชื่อบัญชี":"account_name",
+  "ชื่อร้าน เพจ เว็บไซต์ที่โกง หรือโซเชียลมิเดียคนโกง":"shop_name",
+  "ที่อยู่อีเมล":"email",
+  "มูลค่าที่โกง (บาท)":"fraud_amount",
+  "วันที่โอนเงิน":"date_str",
+  "เวลาที่โอนเงิน":"time_str",
+  "เลขบัญชีอื่น ":"other_accounts"  # ปรับชื่อตามไฟล์จริง
+})
+
+# Normalize account id: เอาเฉพาะตัวเลข
+df['account_id'] = df['account_raw'].astype(str).str.replace(r'\D+', '', regex=True).str.strip()
+df = df[df['account_id'] != '']  # ตัดแถวที่ไม่มีเลขบัญชี
+
+# fraud_amount -> numeric
+df['fraud_amount'] = (
+    df['fraud_amount'].astype(str)
+    .str.replace(",", "", regex=False)
+    .str.extract(r'(\d+)', expand=False)
+    .fillna(0).astype(float)
+)
+
+# date parsing (ifมี)
+df['datetime'] = pd.to_datetime(df['date_str'].astype(str)+' '+df['time_str'].astype(str), errors='coerce')
+
+# basic trim
+for c in ['bank_name','account_name','shop_name','email','other_accounts']:
+    df[c] = df[c].astype(str).str.strip().replace({'nan': None})
+
+df.to_csv("/mnt/data/cleaned_accounts.csv", index=False)
+print("Saved /mnt/data/cleaned_accounts.csv, rows:", len(df))
+```
+
+---
+
+# 2) สร้างเอนทิตี (Entities) และการแมป (ID mapping)
+
+**ทำอะไร:** สร้าง unique IDs สำหรับ `account`, `name`, `shop`, `email`, `bank` เพื่อใช้สร้างกราฟ
+**ผลลัพธ์:** ตาราง mapping และไฟล์ `nodes.csv`, `edges.csv`
+
+```python
+import pandas as pd
+df = pd.read_csv("/mnt/data/cleaned_accounts.csv")
+
+# สร้าง mapping dict
+accounts = df['account_id'].unique().tolist()
+account_map = {a: f"ACC_{i}" for i,a in enumerate(accounts)}
+
+names = df['account_name'].dropna().unique().tolist()
+name_map = {n: f"NAME_{i}" for i,n in enumerate(names)}
+
+shops = df['shop_name'].dropna().unique().tolist()
+shop_map = {s: f"SHOP_{i}" for i,s in enumerate(shops)}
+
+emails = df['email'].dropna().unique().tolist()
+email_map = {e: f"EMAIL_{i}" for i,e in enumerate(emails)}
+
+banks = df['bank_name'].dropna().unique().tolist()
+bank_map = {b: f"BANK_{i}" for i,b in enumerate(banks)}
+
+# สร้าง edges list
+edges = []
+for _, r in df.iterrows():
+    a = account_map.get(r['account_id'])
+    if pd.notna(r['account_name']): edges.append((a, name_map[r['account_name']], 'owns'))
+    if pd.notna(r['shop_name']): edges.append((a, shop_map[r['shop_name']], 'linked_shop'))
+    if pd.notna(r['email']): edges.append((a, email_map[r['email']], 'linked_email'))
+    if pd.notna(r['bank_name']): edges.append((a, bank_map[r['bank_name']], 'bank'))
+
+    # ถ้ามีคอลัมน์ "เลขบัญชีอื่น" ให้เชื่อม ACC-ACC
+    if pd.notna(r.get('other_accounts')) and r['other_accounts'].strip() != '':
+        others = re.split(r'[;,/ ]+', str(r['other_accounts']))
+        for o in others:
+            o_norm = re.sub(r'\D+', '', o)
+            if o_norm in account_map:
+                edges.append((a, account_map[o_norm], 'co_report'))
+
+# Save nodes and edges for inspection
+nodes = []
+for k,v in account_map.items():
+    nodes.append({'node_id':v, 'type':'account', 'raw_id':k})
+for k,v in name_map.items():
+    nodes.append({'node_id':v, 'type':'name', 'raw':k})
+# add shops, emails, banks similarly...
+pd.DataFrame(nodes).to_csv("/mnt/data/nodes.csv", index=False)
+pd.DataFrame(edges, columns=['source','target','relation']).to_csv("/mnt/data/edges.csv", index=False)
+print("nodes/edges saved.")
+```
+
+---
+
+# 3) ขยายความเชื่อมโยง (additional edges & fuzzy matching)
+
+**ทำอะไร:** เพิ่มเชื่อมโยงจากการแมตช์ชื่อ/เบอร์/อีเมลที่คล้ายกัน (fuzzy match) เพื่อจับกรุ๊ปม้า
+**แนะนำ:** ใช้ `rapidfuzz` หรือ `fuzzywuzzy` เพื่อหา similarity ของชื่อ/เพจ แล้วเชื่อมถ้าความคล้าย > 85%
+
+```bash
+# ถ้ายังไม่ได้ติดตั้ง
+pip install rapidfuzz
+```
+
+```python
+from rapidfuzz import process, fuzz
+
+# ตัวอย่าง: หา name groups ที่คล้ายกัน
+names = list(name_map.keys())
+groups = {}
+for n in names:
+    matches = process.extract(n, names, scorer=fuzz.token_sort_ratio, limit=10)
+    for m,score,_ in matches:
+        if m!=n and score>85:
+            # add an artificial edge NAME_n <-> NAME_m (or merge)
+            edges.append((name_map[n], name_map[m], 'name_sim'))
+```
+
+> **เหตุผล:** การ fuzzy-match จะจับกรณีพิมพ์ผิด/ช่องว่าง/สระต่างกัน ซึ่งมักเกิดในบัญชีที่ถูกใช้โดยเครือข่ายเดียวกัน
+
+---
+
+# 4) สร้างกราฟ (Graph construction) และคำนวณ feature เครือข่ายพื้นฐาน
+
+**ทำอะไร:** สร้างกราฟด้วย `networkx` และคำนวณ degree, pagerank, clustering, weighted-degree (sum fraud\_amount) เป็นต้น
+**ผลลัพธ์:** `node_features.csv` (แถว = account node พร้อมฟีเจอร์ทั้งหมด)
+
+```python
+import networkx as nx
+G = nx.Graph()
+
+# โหลด edges จากก่อนหน้า (edges เป็น list ของ tuple)
+for s,t,rel in edges:
+    G.add_node(s)
+    G.add_node(t)
+    G.add_edge(s,t, relation=rel)
+
+# network features for account nodes
+import numpy as np
+node_feat = []
+for node, data in G.nodes(data=True):
+    if node.startswith("ACC_"):
+        deg = G.degree(node)
+        pr = nx.pagerank(G, alpha=0.85).get(node, 0)  # (note: pagerank global cost)
+        clustering = nx.clustering(G, node)
+        # count neighbor types
+        neigh_types = {}
+        for nbr in G.neighbors(node):
+            typ = 'name' if nbr.startswith('NAME_') else ('shop' if nbr.startswith('SHOP_') else ('email' if nbr.startswith('EMAIL_') else 'other'))
+            neigh_types[typ] = neigh_types.get(typ,0)+1
+        node_feat.append({
+            'node':node, 'degree':deg, 'pagerank':pr, 'clustering':clustering,
+            'num_name_neighbors': neigh_types.get('name',0),
+            'num_shop_neighbors': neigh_types.get('shop',0),
+            'num_email_neighbors': neigh_types.get('email',0)
+        })
+
+pd.DataFrame(node_feat).to_csv("/mnt/data/node_features_basic.csv", index=False)
+print("Saved node_features_basic.csv")
+```
+
+> **หมายเหตุ:** การคำนวณบาง metric บนกราฟใหญ่ ๆ จะใช้เวลามาก — ทำเป็น batch หรือเฉพาะบัญชีที่สนใจก่อน
+
+---
+
+# 5) สร้าง matrix ฟีเจอร์สำหรับ GNN (node features numeric)
+
+**ทำอะไร:** รวมฟีเจอร์ตัวเลข (degree, pagerank, avg fraud\_amount, recent\_report\_days, one-hot bank code) ให้เป็น `X` matrix
+**ผลลัพธ์:** `X.npy`, `node_index_map.json` (แม็ป node->row index)
+
+```python
+import json, numpy as np
+nf = pd.read_csv("/mnt/data/node_features_basic.csv")
+# join with other stats like avg fraud amount
+acc_amount = df.groupby('account_id')['fraud_amount'].agg(['count','sum','mean']).reset_index()
+acc_amount['acc_node'] = acc_amount['account_id'].map(account_map)
+nf = nf.merge(acc_amount[['acc_node','count','sum','mean']], left_on='node', right_on='acc_node', how='left').fillna(0)
+
+# bank one-hot: create mapping for banks and add columns
+# (you can also use embeddings later)
+bank_df = df[['account_id','bank_name']].drop_duplicates()
+bank_df['acc_node'] = bank_df['account_id'].map(account_map)
+nf = nf.merge(bank_df[['acc_node','bank_name']], left_on='node', right_on='acc_node', how='left')
+bank_dummies = pd.get_dummies(nf['bank_name'].fillna('UNK'), prefix='BANK')
+nf = pd.concat([nf, bank_dummies], axis=1)
+
+# assemble X
+feature_cols = ['degree','pagerank','clustering','num_name_neighbors','num_shop_neighbors','num_email_neighbors','count','sum','mean'] + list(bank_dummies.columns)
+X = nf[feature_cols].fillna(0).values
+node_index = {row['node']: idx for idx,row in nf.iterrows()}
+
+np.save("/mnt/data/X.npy", X)
+with open("/mnt/data/node_index_map.json","w") as f:
+    json.dump(node_index,f)
+print("Saved X.npy and node_index_map.json")
+```
+
+---
+
+# 6) เตรียม label (supervised) / ถ้าไม่มี negative ให้ทำยังไง
+
+**สถานการณ์:** ไฟล์ blacklist เป็น positives (label=1). คุณต้องหา negative (label=0) — ถ้าไม่มี ให้:
+
+* นำบัญชีทั่วไปจากฐานข้อมูลธนาคารมาสุ่มเป็น negative (best)
+* ถ้าเข้าถึงไม่ได้: ใช้ semi-supervised / label propagation / negative sampling (เลือก accounts ที่ไม่ได้อยู่ใน blacklist เป็น negative)
+  **คำแนะนำ:** ถ้าเป็นไปได้ ให้ทีมธุรกิจ/analyst ให้ sample accounts ที่แน่ใจว่า “ปกติ” เพื่อเป็น negative set
+
+```python
+# สร้าง label vector y (1=blacklist)
+blackset = set(df['account_id'].unique())
+labels = []
+nodes = list(node_index.keys())
+for n in nodes:
+    # แปลง node -> raw account id
+    if n.startswith('ACC_'):
+        raw = n.replace('ACC_','')
+        labels.append(1 if raw in blackset else 0)
+    else:
+        labels.append(0)
+import numpy as np
+y = np.array(labels)
+np.save("/mnt/data/y.npy", y)
+```
+
+---
+
+# 7) สร้าง PyG Data และเทรน GNN (GraphSAGE)
+
+**ทำอะไร:** แปลงกราฟ -> `edge_index` และ `X` → เทรน GraphSAGE เพื่อให้ได้ node embeddings (inductive)
+**ผลลัพธ์:** โมเดล GNN และไฟล์ `node_embeddings.npy`
+
+> ติดตั้งถ้ายังไม่มี: `pip install torch torch_geometric` (เวอร์ชันขึ้นกับ CUDA/PyTorch คุณใช้)
+
+ตัวอย่างโค้ด (โครงร่าง):
+
+```python
+import torch
+from torch_geometric.data import Data
+from torch_geometric.nn import SAGEConv
+import numpy as np
+import json
+
+X = np.load("/mnt/data/X.npy")
+with open("/mnt/data/node_index_map.json") as f:
+    node_index = json.load(f)
+
+# build edge_index from edges (only include nodes in node_index)
+import pandas as pd
+edges_df = pd.read_csv("/mnt/data/edges.csv")
+edge_list = []
+for _,r in edges_df.iterrows():
+    s,t = r['source'], r['target']
+    if s in node_index and t in node_index:
+        edge_list.append((node_index[s], node_index[t]))
+        edge_list.append((node_index[t], node_index[s]))  # undirected twice
+
+edge_index = torch.tensor(edge_list, dtype=torch.long).t().contiguous()
+
+data = Data(x=torch.tensor(X, dtype=torch.float), edge_index=edge_index)
+
+# labels for account nodes (only for nodes that are accounts)
+y = np.load("/mnt/data/y.npy")
+y_t = torch.tensor(y, dtype=torch.float)
+
+# simple GraphSAGE
+class SAGE(torch.nn.Module):
+    def __init__(self, in_dim, hid_dim=64, out_dim=32):
+        super().__init__()
+        self.conv1 = SAGEConv(in_dim, hid_dim)
+        self.conv2 = SAGEConv(hid_dim, out_dim)
+    def forward(self, x, edge_index):
+        x = self.conv1(x, edge_index).relu()
+        x = self.conv2(x, edge_index)
+        return x
+
+model = SAGE(X.shape[1], hid_dim=64, out_dim=32)
+opt = torch.optim.Adam(model.parameters(), lr=0.01, weight_decay=5e-4)
+
+# train simple (supervised) on nodes with labels
+mask = y_t==1  # here we have labels for positives and negatives; refine train/test masks as needed
+
+for epoch in range(1,201):
+    model.train()
+    opt.zero_grad()
+    out = model(data.x, data.edge_index)  # out: [N, out_dim]
+    # for supervised classification you need a classifier head; here we do a simple binary classification head
+    logits = torch.sigmoid(out.sum(dim=1))  # simple aggregator; better: add linear head
+    loss = torch.nn.BCELoss()(logits[mask], y_t[mask])
+    loss.backward()
+    opt.step()
+    if epoch % 20 == 0:
+        print(epoch, loss.item())
+
+# get embeddings
+model.eval()
+emb = model(data.x, data.edge_index).detach().numpy()
+np.save("/mnt/data/node_embeddings.npy", emb)
+print("Saved node_embeddings.npy")
+```
+
+> **หมายเหตุ:** โค้ดข้างต้นเป็น skeleton — ในทางปฏิบัติให้ใช้ classifier head (Linear -> Sigmoid), ทำ train/val/test split, early stopping และ balanced sampling
+
+---
+
+# 8) ผสาน embedding กับฟีเจอร์ตาราง (tabular features)
+
+**ทำอะไร:** โหลด `node_embeddings.npy` ต่อด้วย `node_features` → รวมเป็น dataframe เพื่อเทรน LightGBM
+**ผลลัพธ์:** `train_table.csv` (features + label)
+
+```python
+import numpy as np, pandas as pd, json
+emb = np.load("/mnt/data/node_embeddings.npy")
+nf = pd.read_csv("/mnt/data/node_features_basic.csv")  # ให้แน่ใจว่า index ตรงกับ node_index
+with open("/mnt/data/node_index_map.json") as f:
+    node_index = json.load(f)
+
+# make df where row order matches node_index order
+rows = []
+for node, idx in sorted(node_index.items(), key=lambda x:x[1]):
+    # find nf row
+    r = nf[nf['node']==node]
+    if len(r)==0:
+        base = {'degree':0,'pagerank':0,'clustering':0,'num_name_neighbors':0,'num_shop_neighbors':0,'num_email_neighbors':0}
+    else:
+        base = r.iloc[0].to_dict()
+    emb_vec = emb[idx].tolist()
+    row = {**base}
+    for i,v in enumerate(emb_vec):
+        row[f'emb_{i}'] = v
+    rows.append(row)
+
+train_df = pd.DataFrame(rows)
+train_df['label'] = np.load("/mnt/data/y.npy")
+train_df.to_csv("/mnt/data/train_table.csv", index=False)
+print("Saved train_table.csv")
+```
+
+---
+
+# 9) เทรน LightGBM (final classifier)
+
+**ทำอะไร:** เทรน LightGBM บนตารางที่รวม embedding + features → ให้ final risk score
+**ผลลัพธ์:** โมเดล LightGBM ที่บันทึกไว้ (`model.txt`) และรายงาน metric
+
+```python
+import lightgbm as lgb
+import pandas as pd
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import roc_auc_score, precision_recall_fscore_support
+
+df = pd.read_csv("/mnt/data/train_table.csv")
+X = df.drop(columns=['label'])
+y = df['label']
+
+X_train, X_val, y_train, y_val = train_test_split(X, y, stratify=y, test_size=0.2, random_state=42)
+
+dtrain = lgb.Dataset(X_train, label=y_train)
+dval = lgb.Dataset(X_val, label=y_val, reference=dtrain)
+
+params = {
+    'objective':'binary',
+    'metric':'auc',
+    'boosting':'gbdt',
+    'verbosity': -1,
+    'is_unbalance': True,
+    'learning_rate':0.05,
+    'num_leaves': 63
+}
+
+bst = lgb.train(params, dtrain, valid_sets=[dval], num_boost_round=1000, early_stopping_rounds=50)
+bst.save_model('/mnt/data/lightgbm_model.txt')
+
+y_pred = bst.predict(X_val)
+auc = roc_auc_score(y_val, y_pred)
+print("AUC:", auc)
+```
+
+---
+
+# 10) เลือก threshold & ตัดสินใจเชิงธุรกิจ
+
+**ทำอะไร:** จาก `y_pred` เลือก threshold ที่เหมาะ (precision\@k หรือ max F1 หรือ ค่า FPR ที่ยอมรับได้)
+**คำแนะนำปฏิบัติ:**
+
+* ถ้าต้องการลด false positives → เลือก threshold สูงขึ้น (เน้น precision)
+* ถ้าต้องการจับให้ได้มาก → เลือก threshold ต่ำลง (เน้น recall)
+* ใช้ Precision\@k: ดู top-k accounts ที่โมเดลให้คะแนนสูงสุด และส่งให้ analyst ตรวจ
+
+ตัวอย่างการเลือก threshold:
+
+```python
+import numpy as np
+# choose threshold to get desired precision
+from sklearn.metrics import precision_recall_curve
+prec, rec, thr = precision_recall_curve(y_val, y_pred)
+# find threshold with precision >= 0.9 (example)
+idx = np.argmax(prec >= 0.90)
+chosen_thr = thr[idx] if idx < len(thr) else 0.99
+print("chosen threshold:", chosen_thr)
+```
+
+---
+
+# 11) Deployment (สถาปัตยกรรมแนะนำ)
+
+**สั้น ๆ:**
+
+* **Batch offline:** ทุกคืน/ทุกสัปดาห์ สร้าง graph ใหม่ → เทรน/อัปเดต GNN embedding → เทรน LightGBM → เก็บ models ใน registry
+* **Real-time / near-real-time scoring:**
+
+  * ถ้ามีธุรกรรมเข้ามา: map entity → ดึง/คำนวณ node features (degree, neighbor counts) → ถ้า node ใหม่ ใช้ GraphSAGE แบบ inductive เพื่อคำนวณ embedding จาก neighbor features → ส่ง embedding+features ให้ LightGBM → คืน risk score
+* **Components:** Feature store (Feast), message queue (Kafka), model serving (TorchServe / FastAPI), DB สำหรับ logs, Analyst UI
+
+---
+
+# 12) Monitoring, feedback & continuous learning
+
+**ทำอะไร:** เก็บผลลัพธ์การตัดสินใจ, rate ของ false positive/negative, analyst feedback → ใช้เพื่อ re-train (active learning)
+**KPIs ที่ต้อง track:** Precision, Recall, PR-AUC, Alerts per analyst per day, False Positive Rate, Time-to-review
+
+---
+
+## ข้อควรระวัง / tips เพิ่มเติม
+
+* **การขาด negative labels** เป็นปัญหาใหญ่ — หาวิธีนำข้อมูลบัญชีปกติอย่างน้อยเป็นตัวเปรียบเทียบ
+* **Class imbalance**: ใช้ `scale_pos_weight` หรือ sampling หรือ focal loss
+* **Privacy & Compliance**: ลบ/มาสก์ PII ก่อนเอาออกนอก environment และเก็บ logs สำหรับ audit
+* **Explainability**: ให้ LightGBM feature importance + แสดง neighbors จากกราฟ (analyst view) เพื่อช่วยตัดสิน
+
+---
+
+## สิ่งที่ผมแนะนำให้คุณทำ **ตอนนี้** (Immediate next actions — 3 งานแรกที่ต้องรัน)
+
+1. รันโค้ด **Section 1-3** เพื่อได้ `cleaned_accounts.csv`, `nodes.csv`, `edges.csv`
+2. รัน **Section 4-6** เพื่อสร้าง `node_features_basic.csv`, `X.npy`, `node_embeddings.npy` (เบื้องต้น)
+3. รัน **Section 8-9** เพื่อเทรน LightGBM และดู AUC/PR
+
+---
+
+ถ้าต้องการ ผมช่วยได้ต่อ:
+
+* แปลงโค้ดตัวอย่างเป็น **script เต็ม** ให้ (ไฟล์ `.py`) ที่รันทีเดียวเป็น pipeline (preprocess → graph → GNN → tabular)
+* เขียน **notebook** ที่รันทีละเซลล์ (เหมาะสำหรับทดลอง)
+* ช่วยปรับ hyperparams, ทำ CV, หรือสร้าง Analyst UI skeleton
+
+อยากให้ผม **สร้าง script/pipeline ให้เป็นไฟล์เดียว** (เช่น `build_pipeline.py`) หรือให้ผม **รันบางส่วนของโค้ดบนไฟล์ที่มีอยู่** ให้คุณเลยตอนนี้ไหม? (ผมจะส่งไฟล์โค้ดให้คุณดาวน์โหลด)
